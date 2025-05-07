@@ -1,4 +1,4 @@
-# app.py
+# scraper_api.py
 
 import requests
 from bs4 import BeautifulSoup
@@ -8,7 +8,6 @@ from flask_cors import CORS
 import logging
 from urllib.parse import quote, unquote
 import uuid
-import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -878,5 +877,6 @@ class StreamLinks(Resource):
             return jsonify(data), 404
         return jsonify(data)
 
-# Note: The application is run via Gunicorn in production on Render.com.
-# Command: gunicorn -w 4 -b 0.0.0.0:$PORT app:app
+# Only change needed - ensure debug mode is OFF in production
+if __name__ == '__main__':
+    app.run(debug=False)  # Changed debug to False
