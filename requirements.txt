@@ -4,4 +4,4 @@ requests
 beautifulsoup4
 pydantic
 python-multipart
-gunicorn  # <--- Add this line
+gunicorn
