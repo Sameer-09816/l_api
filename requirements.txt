@@ -3,5 +3,3 @@ uvicorn[standard]
 requests
 beautifulsoup4
 pydantic
-python-multipart
-gunicorn
