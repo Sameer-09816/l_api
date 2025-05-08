@@ -1,5 +1,5 @@
 fastapi
-uvicorn
-gunicorn
-requests
+uvicorn[standard]
+httpx
 beautifulsoup4
+pydantic
