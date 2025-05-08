@@ -218,39 +218,33 @@ def scrape_videos(url: str) -> List[VideoData]:
         raise HTTPException(status_code=500, detail=f"Error processing webpage: {str(e)}")
 
 def scrape_generic_page(section: str, page_number: int) -> List[VideoData]:
+    """
+    Scrapes a specific page number from hqporn.xxx/{section}/ (e.g., trend, fresh, best).
+    Returns None for HTTP errors, [] for empty or non-existent pages.
+    """
     scrape_url = f"{BASE_URL}/{section}/{page_number}/" if page_number > 1 else f"{BASE_URL}/{section}/"
     logger.info(f"Attempting to scrape {section} page {page_number}: {scrape_url}")
+
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
+
     try:
         response = requests.get(scrape_url, headers=headers, timeout=15)
         response.raise_for_status()
-        if response.url != scrape_url:
-            logger.warning(f"Redirect detected from {scrape_url} to {response.url}")
-            return []
     except requests.exceptions.RequestException as e:
         logger.error(f"Error fetching {scrape_url}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching {section} page {page_number}: {str(e)}")
+        return None
 
     soup = BeautifulSoup(response.content, 'html.parser')
     gallery_list_container = soup.find('div', id='galleries', class_='js-gallery-list')
     if not gallery_list_container:
-        logger.warning(f"Gallery list container not found on {scrape_url}. Checking for pagination or error.")
-        # Check for "no results" or end of pagination
-        no_results = soup.find('div', class_='b-catalog-info-descr')
-        if no_results and "no results found" in no_results.get_text(strip=True).lower():
-            logger.info(f"No results found on {scrape_url}.")
-            return []
+        logger.warning(f"Gallery list container not found on {scrape_url}. It might be an empty page or end of pagination.")
         return []
 
     items = gallery_list_container.find_all('div', class_='b-thumb-item')
     if not items:
-        logger.info(f"No items found on page {page_number} of /{section}/.")
-        # Check pagination controls to confirm end of pages
-        pagination = soup.find('div', class_='b-paginator')
-        if pagination and not pagination.find('a', class_='next'):
-            logger.info(f"No 'next' page link found, likely end of pagination for {section}.")
+        logger.info(f"No items found on page {page_number} of /{section}/. This could be the end of pagination.")
         return []
 
     scraped_data = []
@@ -269,7 +263,7 @@ def scrape_generic_page(section: str, page_number: int) -> List[VideoData]:
             continue
 
         title_div = item_soup.find('div', class_='b-thumb-item__title')
-        data['title'] = title_div.get_text(strip=True) if title_div else data.get('title_attribute', 'N/A')
+        data['title'] = title_div.get_text(separator=' ', strip=True) if title_div else data.get('title_attribute', 'N/A')
 
         picture_tag = item_soup.find('picture', class_='js-gallery-img')
         image_urls = {}
@@ -303,7 +297,7 @@ def scrape_generic_page(section: str, page_number: int) -> List[VideoData]:
 
 def scrape_all_trend_pages() -> List[VideoData]:
     """
-    Scrapes all trend pages from page 1 until no more items are found or pagination ends.
+    Scrapes all trend pages from page 1 until no more items are found or an error occurs.
     """
     logger.info("Starting to scrape all trend pages from page 1")
     all_videos = []
@@ -312,28 +306,15 @@ def scrape_all_trend_pages() -> List[VideoData]:
 
     while page_number <= max_pages:
         videos = scrape_generic_page("trend", page_number)
+        if videos is None:
+            logger.error(f"Failed to scrape trend page {page_number}. Stopping.")
+            break
         if not videos:
             logger.info(f"No more items found on trend page {page_number}. Stopping.")
             break
         all_videos.extend(videos)
         logger.info(f"Scraped page {page_number} with {len(videos)} videos. Total so far: {len(all_videos)}")
         page_number += 1
-
-        # Check for pagination controls to confirm if more pages exist
-        scrape_url = f"{BASE_URL}/trend/{page_number}/" if page_number > 1 else f"{BASE_URL}/trend/"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        try:
-            response = requests.get(scrape_url, headers=headers, timeout=15)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            pagination = soup.find('div', class_='b-paginator')
-            if pagination and not pagination.find('a', class_='next'):
-                logger.info(f"No 'next' page link found on page {page_number}. Assuming end of pagination.")
-                break
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error checking pagination for page {page_number}: {e}")
-            break
 
     logger.info(f"Finished scraping all trend pages. Total videos: {len(all_videos)}")
     return all_videos
@@ -549,7 +530,7 @@ def scrape_channels_page(page_number: int) -> List[ChannelData]:
 
     items = channel_list_container.find_all('div', class_='b-thumb-item--cat')
     if not items:
-        logger.info(f"No channel items found on pagePairs {page_number}.")
+        logger.info(f"No channel items found on page {page_number}.")
         return []
 
     scraped_data = []
@@ -616,7 +597,10 @@ async def get_fresh_page(page_number: int):
     """
     if page_number <= 0:
         raise HTTPException(status_code=400, detail="Page number must be positive.")
-    return scrape_generic_page("fresh", page_number)
+    videos = scrape_generic_page("fresh", page_number)
+    if videos is None:
+        raise HTTPException(status_code=500, detail="Failed to scrape the page. The website might be down or content is not available.")
+    return videos
 
 @app.get("/api/search/{search_content}/{page_number}", response_model=List[VideoData])
 async def get_search_results_page(search_content: str, page_number: int):
@@ -636,7 +620,10 @@ async def get_best_rated_page(page_number: int):
     """
     if page_number <= 0:
         raise HTTPException(status_code=400, detail="Page number must be positive.")
-    return scrape_generic_page("best", page_number)
+    videos = scrape_generic_page("best", page_number)
+    if videos is None:
+        raise HTTPException(status_code=500, detail="Failed to scrape the page. The website might be down or content is not available.")
+    return videos
 
 @app.get("/api/categories/{page_number}", response_model=List[CategoryData])
 async def get_categories_page(page_number: int):
@@ -655,6 +642,8 @@ async def get_trend_page(page_number: int):
     if page_number <= 0:
         raise HTTPException(status_code=400, detail="Page number must be positive.")
     videos = scrape_generic_page("trend", page_number)
+    if videos is None:
+        raise HTTPException(status_code=500, detail="Failed to scrape the page. The website might be down or content is not available.")
     if not videos and page_number > 1:
         raise HTTPException(status_code=404, detail=f"No videos found on trend page {page_number}. It may not exist.")
     return videos
