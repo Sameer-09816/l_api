@@ -2,5 +2,6 @@ requests
 beautifulsoup4
 Flask
 flask-restx
-flask-cors
+Flask-CORS
+pydantic
 gunicorn
