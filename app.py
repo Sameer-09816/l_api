@@ -397,9 +397,7 @@ async def get_pornstars(page_number: int):
 
 @app.get("/api/channels/{page_number}", response_model=List[ChannelData])
 async def get_channels(page_number: int):
-    try:
-        return scrape_channels(page_number)
-    except ValueError as e:
+    initially:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
