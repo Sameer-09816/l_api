@@ -1,884 +1,704 @@
-# scraper_api.py
+import os
+import uuid
+import logging
+from typing import List, Dict, Optional, Any
+from urllib.parse import quote
+
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify # Removed abort from flask, will use api.abort
-from flask_restx import Api, Resource, fields
-from flask_cors import CORS
-import logging
-from urllib.parse import quote # Removed unquote as it wasn't actively used for resolution
-import os
-from typing import List, Dict # Added typing for new function
+from fastapi import FastAPI, HTTPException, Path, Body
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
 
-# Pydantic for internal data structuring in the new scraper function
-from pydantic import BaseModel
+# --- Configure Logging ---
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(asctime)s %(message)s')
+logger = logging.getLogger(__name__)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__) # Corrected to use __name__ for Flask standard
+# --- Global Constants ---
+BASE_URL_HQPORN = "https://hqporn.xxx"
+SCRAPE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
 
-app = Flask(__name__) # Corrected to use __name__
-CORS(app)  # Enable CORS to allow requests from any origin
+# --- Pydantic Models ---
 
-# Initialize Flask-RESTX for Swagger documentation
-api = Api(
-    app,
-    version='1.0',
-    title='HQ Porn Scraper API',
-    description='A unified API for scraping fresh, best, trending videos, pornstars, channels, categories, search results, stream links, and generic page video extraction from hqporn.xxx',
-    doc='/api/docs/'
-)
+# Models from input_file_0.py (Generic Video Scraper)
+class ScrapeRequest(BaseModel):
+    url: HttpUrl # Ensure it's a valid URL
 
-BASE_URL = "https://hqporn.xxx"
-
-# --- Pydantic models for the new generic scraper (internal use) ---
-class ScrapedTag(BaseModel):
-    link: str
+class Tag(BaseModel):
+    link: str # Can be HttpUrl if always absolute, or str if sometimes relative
     name: str
 
-class ScrapedImageUrls(BaseModel):
-    img_src: str
-    jpeg: str
-    webp: str
+class ImageUrls(BaseModel):
+    img_src: Optional[str] = None
+    jpeg: Optional[str] = None
+    webp: Optional[str] = None
 
-class ScrapedVideoData(BaseModel):
-    duration: str
-    gallery_id: str
-    image_urls: ScrapedImageUrls
+class VideoData(BaseModel): # Used by original /scrape-videos
+    duration: Optional[str] = None
+    gallery_id: Optional[str] = None
+    image_urls: ImageUrls
     link: str
-    preview_video_url: str
-    tags: List[ScrapedTag]
-    thumb_id: str
+    preview_video_url: Optional[str] = None
+    tags: List[Tag]
+    thumb_id: Optional[str] = None
     title: str
-    title_attribute: str
+    title_attribute: Optional[str] = None # Often same as title
 
-# --- End Pydantic models ---
+# Model for many hqporn list items (fresh, best, search, trend)
+class GenericVideoListItem(BaseModel):
+    link: str
+    gallery_id: Optional[str] = None
+    thumb_id: Optional[str] = None
+    preview_video_url: Optional[str] = None
+    title_attribute: Optional[str] = None
+    title: str
+    image_urls: ImageUrls
+    duration: Optional[str] = None
+    tags: List[Tag]
 
+# Model for Category items (from input_file_6.py)
+class CategoryItem(BaseModel):
+    link: str
+    category_id: Optional[str] = None
+    title: str
+    image_urls: ImageUrls
 
-# Define namespaces for better organization in Swagger
-ns_fresh = api.namespace('fresh', description='Operations related to fresh videos')
-ns_best = api.namespace('best', description='Operations related to best-rated videos')
-ns_trend = api.namespace('trend', description='Operations related to trending videos')
-ns_pornstars = api.namespace('pornstars', description='Operations related to pornstars')
-ns_channels = api.namespace('channels', description='Operations related to channels')
-ns_categories = api.namespace('categories', description='Operations related to categories')
-ns_search = api.namespace('search', description='Operations related to search results')
-ns_stream = api.namespace('stream', description='Operations related to video stream links')
-# New namespace for the generic URL scraper
-ns_general_scrape = api.namespace('scrape_generic', description='Scrape videos from any provided hqporn.xxx page URL supporting the common thumbnail structure')
+# Model for Channel items (from input_file_4.py)
+class ChannelItem(BaseModel):
+    link: str
+    channel_id: Optional[str] = None
+    name: str # title is used in the original scraper logic for name here
+    image_urls: ImageUrls
 
+# Model for Pornstar items (from input_file_7.py)
+class PornstarItem(BaseModel):
+    link: str
+    pornstar_id: Optional[str] = None
+    name: str
+    image_urls: ImageUrls
 
-# Define data models for Swagger documentation
-# Re-using existing video_model for the new endpoint's response
-video_model = api.model('Video', {
-    'link': fields.String(description='Video page URL'),
-    'gallery_id': fields.String(description='Gallery ID'),
-    'thumb_id': fields.String(description='Thumbnail ID'),
-    'preview_video_url': fields.String(description='Preview video URL'),
-    'title_attribute': fields.String(description='Title from link attribute or main title'),
-    'title': fields.String(description='Video title'),
-    'image_urls': fields.Nested(api.model('ImageURLs', {
-        'webp': fields.String(description='WebP image URL'),
-        'jpeg': fields.String(description='JPEG image URL'),
-        'img_src': fields.String(description='Image source URL')
-    })),
-    'duration': fields.String(description='Video duration'),
-    'tags': fields.List(fields.Nested(api.model('Tag', { # Note: Name 'Tag' here is fine for Flask-RESTX model
-        'name': fields.String(description='Tag name'),
-        'link': fields.String(description='Tag URL')
-    })))
-})
+# Models for Stream Link Scraper (from input_file_1.py)
+class SourceTagItem(BaseModel):
+    src: str
+    type: Optional[str] = None
+    size: Optional[str] = None # Or int if it's always a number
 
-pornstar_model = api.model('Pornstar', {
-    'link': fields.String(description='Pornstar page URL'),
-    'pornstar_id': fields.String(description='Pornstar ID'),
-    'name': fields.String(description='Pornstar name'),
-    'image_urls': fields.Nested(api.model('ImageURLs_Pornstar', {
-        'webp': fields.String(description='WebP image URL'),
-        'jpeg': fields.String(description='JPEG image URL'),
-        'img_src': fields.String(description='Image source URL')
-    }))
-})
-
-channel_model = api.model('Channel', {
-    'link': fields.String(description='Channel page URL'),
-    'channel_id': fields.String(description='Channel ID'),
-    'name': fields.String(description='Channel name'),
-    'image_urls': fields.Nested(api.model('ImageURLs_Channel', {
-        'webp': fields.String(description='WebP image URL'),
-        'jpeg': fields.String(description='JPEG image URL'),
-        'img_src': fields.String(description='Image source URL')
-    }))
-})
-
-category_model = api.model('Category', {
-    'link': fields.String(description='Category page URL'),
-    'category_id': fields.String(description='Category ID'),
-    'title': fields.String(description='Category title'),
-    'image_urls': fields.Nested(api.model('ImageURLs_Category', {
-        'webp': fields.String(description='WebP image URL'),
-        'jpeg': fields.String(description='JPEG image URL'),
-        'img_src': fields.String(description='Image source URL')
-    }))
-})
-
-stream_model = api.model('Stream', {
-    'video_page_url': fields.String(description='Video page URL'),
-    'main_video_src': fields.String(description='Main video source URL'),
-    'source_tags': fields.List(fields.Nested(api.model('SourceTag', {
-        'src': fields.String(description='Source URL'),
-        'type': fields.String(description='Source type'),
-        'size': fields.String(description='Source size')
-    }))),
-    'poster_image': fields.String(description='Poster image URL'),
-    'sprite_previews': fields.List(fields.String, description='Sprite preview URLs'),
-    'error': fields.String(description='Error message, if any'),
-    'note': fields.String(description='Additional notes, if any')
-})
-
-# Model for the generic scraper input URL
-url_input_model = ns_general_scrape.model('UrlInput', {
-    'url': fields.String(required=True, description='The full URL of the page to scrape for videos (must be from hqporn.xxx domain or similarly structured)')
-})
+class StreamDataItem(BaseModel):
+    video_page_url: str
+    main_video_src: Optional[str] = None
+    source_tags: List[SourceTagItem]
+    poster_image: Optional[str] = None
+    sprite_previews: List[str]
+    note: Optional[str] = None
+    error: Optional[str] = None # For cases where video tag isn't found
 
 
-# --- Scraper Functions ---
+# --- FastAPI Application Instance ---
+app = FastAPI(
+    title="Unified Scraper API",
+    description="An API that combines various web scrapers for video and content metadata.",
+    version="1.0.0"
+)
 
-# New scraper function adapted from FastAPI input_file_0.py
-def scrape_generic_page_videos(url: str, current_api_instance: Api) -> List[Dict]:
-    """
-    Scrapes video data from a generic webpage URL (expected to be hqporn.xxx or similar structure).
-    Uses Pydantic models internally for data structuring.
-    """
-    logger.info(f"Attempting to scrape generic video page: {url}")
+# --- CORS Middleware ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# --- Helper Function to make HTTP requests ---
+def make_request(url: str, timeout: int = 15) -> Optional[requests.Response]:
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()  # Raise an exception for bad status codes
+        response = requests.get(url, headers=SCRAPE_HEADERS, timeout=timeout)
+        response.raise_for_status()
+        return response
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching {url}: {e}")
+        return None
+
+# --- Scraping Functions ---
+
+# From input_file_0.py (Generic Video Scraper)
+def scrape_videos_generic(url: str) -> List[VideoData]:
+    try:
+        response = make_request(url, timeout=10)
+        if not response:
+            raise HTTPException(status_code=500, detail=f"Error fetching webpage: {url}")
 
         soup = BeautifulSoup(response.text, "html.parser")
-        # Class from input_file_0.py
         video_items = soup.find_all("div", class_="b-thumb-item js-thumb-item js-thumb")
-
-        if not video_items:
-            # Check if the specific selector was the issue, vs an empty standard gallery
-            gallery_list_container = soup.find('div', id='galleries', class_='js-gallery-list')
-            if gallery_list_container:
-                standard_items = gallery_list_container.find_all('div', class_='b-thumb-item')
-                if not standard_items:
-                    logger.info(f"No standard 'b-thumb-item' found in 'js-gallery-list' on {url} either.")
-                else:
-                    logger.info(f"Found 'b-thumb-item' under 'js-gallery-list', but not 'b-thumb-item js-thumb-item js-thumb'. The target class for generic scraper might be too specific for this page: {url}")
-
-        videos_pydantic = []
+        videos = []
         for item in video_items:
-            if "random-thumb" in item.get("class", []): # Skip ads or random items
+            if "random-thumb" in item.get("class", []):
                 continue
 
             title_elem = item.find("div", class_="b-thumb-item__title js-gallery-title")
             title = title_elem.get_text(strip=True) if title_elem else "Unknown"
-            # Per input_file_0.py, title_attribute is same as title.
-            # Existing Flask scrapers get it from link_tag.get('title').
-            # For this generic one, let's see if link_tag provides it.
-            
-            link_elem = item.find("a", class_="js-gallery-stats js-gallery-link") # Standard link class in hqporn
-            if not link_elem : # Fallback to any <a> tag with href if specific one not found
-                 link_elem = item.find("a", href=True)
-
-
-            title_attribute = title # Default as per FastAPI file
-            if link_elem and link_elem.get('title'):
-                title_attribute = link_elem.get('title').strip() # Prefer <a> tag's title for title_attribute
+            title_attribute = title
 
             duration_elem = item.find("div", class_="b-thumb-item__duration")
-            duration = duration_elem.find("span").get_text(strip=True) if duration_elem and duration_elem.find("span") else "N/A"
+            duration = duration_elem.find("span").get_text(strip=True) if duration_elem and duration_elem.find("span") else "Unknown"
 
-            img_elem = item.find("img") # General image
-            img_src = ""
-            jpeg = ""
-            webp = ""
+            img_elem = item.find("img")
+            img_src = img_elem["src"] if img_elem and "src" in img_elem.attrs else ""
+            jpeg_source = item.find("source", type="image/jpeg")
+            webp_source = item.find("source", type="image/webp")
+            jpeg = jpeg_source["srcset"] if jpeg_source and "srcset" in jpeg_source.attrs else img_src
+            webp = webp_source["srcset"] if webp_source and "srcset" in webp_source.attrs else ""
 
-            picture_tag = item.find('picture', class_='js-gallery-img') # More specific image structure
-            if picture_tag:
-                source_webp_tag = picture_tag.find('source', attrs={'type': 'image/webp'})
-                webp = source_webp_tag['srcset'] if source_webp_tag and source_webp_tag.has_attr('srcset') else ''
-                source_jpeg_tag = picture_tag.find('source', attrs={'type': 'image/jpeg'})
-                jpeg = source_jpeg_tag['srcset'] if source_jpeg_tag and source_jpeg_tag.has_attr('srcset') else ''
-                img_tag_in_picture = picture_tag.find('img')
-                if img_tag_in_picture:
-                    img_src = img_tag_in_picture.get('data-src', img_tag_in_picture.get('src', ''))
-            elif img_elem and "src" in img_elem.attrs: # Fallback to simple img src
-                 img_src = img_elem["src"]
-                 jpeg = img_src # If only img_src, use it for jpeg as well. Webp might be empty.
-            
-            # Further refined based on input_file_0.py if general methods above fail
-            if not jpeg and not webp and img_elem: # Use FastAPI logic if picture_tag wasn't specific enough
-                img_src_from_fastapi = img_elem["src"] if img_elem and "src" in img_elem.attrs else ""
-                jpeg_source = item.find("source", type="image/jpeg")
-                webp_source = item.find("source", type="image/webp")
-                jpeg_from_fastapi = jpeg_source["srcset"] if jpeg_source and "srcset" in jpeg_source.attrs else img_src_from_fastapi
-                webp_from_fastapi = webp_source["srcset"] if webp_source and "srcset" in webp_source.attrs else ""
-                
-                if not img_src: img_src = img_src_from_fastapi
-                if not jpeg: jpeg = jpeg_from_fastapi
-                if not webp: webp = webp_from_fastapi
+            link_elem = item.find("a", class_="js-gallery-stats js-gallery-link")
+            link = link_elem["href"] if link_elem and "href" in link_elem.attrs else ""
+            if link and not link.startswith("http"): # Assuming relative links need hqporn base
+                 link = f"{BASE_URL_HQPORN}{link}" if link.startswith('/') else f"{BASE_URL_HQPORN}/{link}"
 
 
-            link = ""
-            gallery_id = "Unknown"
-            preview_video_url = ""
-            thumb_id = "Unknown"
+            gallery_id = link_elem["data-gallery-id"] if link_elem and "data-gallery-id" in link_elem.attrs else "Unknown"
+            preview_video_url = link_elem["data-preview"] if link_elem and "data-preview" in link_elem.attrs else ""
+            thumb_id = link_elem["data-thumb-id"] if link_elem and "data-thumb-id" in link_elem.attrs else "Unknown"
 
-            if link_elem:
-                href = link_elem.get("href", "")
-                link = href if href.startswith("http") else (f"{BASE_URL}{href}" if href else "")
-                gallery_id = link_elem.get("data-gallery-id", "Unknown")
-                preview_video_url = link_elem.get("data-preview", "")
-                thumb_id = link_elem.get("data-thumb-id", "Unknown")
-
-
-            tags_data = []
             categories_elem = item.find("div", class_="b-thumb-item__detail")
+            tags_list = []
             if categories_elem:
                 category_links = categories_elem.find_all("a")
-                for cat_link_elem in category_links:
-                    cat_href = cat_link_elem.get("href", "")
-                    cat_name = cat_link_elem.get_text(strip=True)
-                    full_cat_link = cat_href if cat_href.startswith("http") else (f"{BASE_URL}{cat_href}" if cat_href else "")
-                    if cat_name and full_cat_link:
-                        tags_data.append(ScrapedTag(link=full_cat_link, name=cat_name))
-            
-            # Create ScrapedVideoData object
-            video_pydantic_obj = ScrapedVideoData(
+                tags_list = [
+                    Tag(
+                        link=cat_link["href"] if cat_link["href"].startswith("http") else f"{BASE_URL_HQPORN}{cat_link['href']}",
+                        name=cat_link.get_text(strip=True)
+                    )
+                    for cat_link in category_links if cat_link.has_attr('href')
+                ]
+
+            videos.append(VideoData(
                 duration=duration,
                 gallery_id=gallery_id,
-                image_urls=ScrapedImageUrls(
-                    img_src=img_src,
-                    jpeg=jpeg,
-                    webp=webp
-                ),
+                image_urls=ImageUrls(img_src=img_src, jpeg=jpeg, webp=webp),
                 link=link,
                 preview_video_url=preview_video_url,
-                tags=tags_data,
+                tags=tags_list,
                 thumb_id=thumb_id,
                 title=title,
-                title_attribute=title_attribute # Uses refined title_attribute
-            )
-            videos_pydantic.append(video_pydantic_obj)
-        
-        return [video.dict() for video in videos_pydantic]
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching webpage {url} for generic scrape: {str(e)}")
-        current_api_instance.abort(500, detail=f"Error fetching webpage: {str(e)}") # Use detail for FastAPI like error
+                title_attribute=title_attribute
+            ))
+        return videos
     except Exception as e:
-        logger.error(f"Error processing webpage {url} for generic scrape: {str(e)}")
-        current_api_instance.abort(500, detail=f"Error processing webpage: {str(e)}")
+        logger.error(f"Error processing webpage {url}: {str(e)}")
+        # This specific scraper function might need to re-raise or handle differently
+        # For now, return empty or let FastAPI handle via HTTPException from endpoint
+        raise HTTPException(status_code=500, detail=f"Error processing webpage: {str(e)}")
+
+# Common parser for hqporn video list items
+def _parse_hqporn_video_item(item_soup: BeautifulSoup) -> Optional[GenericVideoListItem]:
+    data = {}
+    link_tag = item_soup.find('a', class_='js-gallery-link')
+    if not link_tag:
+        logger.warning("Found an item with no js-gallery-link.")
+        return None
+
+    href = link_tag.get('href')
+    data['link'] = f"{BASE_URL_HQPORN}{href}" if href and href.startswith('/') else href
+    data['gallery_id'] = link_tag.get('data-gallery-id')
+    data['thumb_id'] = link_tag.get('data-thumb-id')
+    data['preview_video_url'] = link_tag.get('data-preview')
+    data['title_attribute'] = link_tag.get('title')
+
+    title_div = item_soup.find('div', class_='b-thumb-item__title')
+    data['title'] = title_div.get_text(separator=' ', strip=True) if title_div else data.get('title_attribute', 'N/A')
+
+    image_urls = {}
+    picture_tag = item_soup.find('picture', class_='js-gallery-img')
+    if picture_tag:
+        source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
+        image_urls['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
+        source_jpeg = picture_tag.find('source', attrs={'type': 'image/jpeg'})
+        image_urls['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
+        img_tag = picture_tag.find('img')
+        if img_tag:
+            image_urls['img_src'] = img_tag.get('data-src', img_tag.get('src'))
+    data['image_urls'] = ImageUrls(**image_urls)
+
+    duration_div = item_soup.find('div', class_='b-thumb-item__duration')
+    duration_span = duration_div.find('span') if duration_div else None
+    data['duration'] = duration_span.text.strip() if duration_span else None
+
+    tags_list = []
+    detail_div = item_soup.find('div', class_='b-thumb-item__detail')
+    if detail_div:
+        for tag_a in detail_div.find_all('a'):
+            tag_name = tag_a.text.strip()
+            tag_link_relative = tag_a.get('href')
+            if tag_name and tag_link_relative:
+                tag_link_full = f"{BASE_URL_HQPORN}{tag_link_relative}" if tag_link_relative.startswith('/') else tag_link_relative
+                tags_list.append(Tag(name=tag_name, link=tag_link_full))
+    data['tags'] = tags_list
+    
+    return GenericVideoListItem(**data)
 
 
-def scrape_hqporn_fresh_page(page_number):
-    scrape_url = f"{BASE_URL}/fresh/{page_number}/"
+def _scrape_hqporn_video_list_page(scrape_url: str, page_description: str) -> Optional[List[GenericVideoListItem]]:
+    logger.info(f"Attempting to scrape {page_description}: {scrape_url}")
+    response = make_request(scrape_url)
+    if not response:
+        return None
+
+    soup = BeautifulSoup(response.content, 'html.parser')
+    gallery_list_container = soup.find('div', id='galleries', class_='js-gallery-list')
+    if not gallery_list_container:
+        no_results_msg_div = soup.find('div', class_='b-catalog-info-descr') # For search
+        if no_results_msg_div and "no results found" in no_results_msg_div.get_text(strip=True).lower():
+             logger.info(f"No results found for {page_description} at {scrape_url}")
+        else:
+            logger.warning(f"Gallery list container not found on {scrape_url} for {page_description}.")
+        return []
+
+    items = gallery_list_container.find_all('div', class_='b-thumb-item')
+    if not items:
+        logger.info(f"No items found on {scrape_url} for {page_description}.")
+        return []
+
+    scraped_data = []
+    for item_soup in items:
+        parsed_item = _parse_hqporn_video_item(item_soup)
+        if parsed_item:
+            scraped_data.append(parsed_item)
+    return scraped_data
+
+
+# From input_file_1.py (Stream Link Scraper)
+def scrape_video_page_for_streams(video_page_url: str) -> StreamDataItem:
+    logger.info(f"Attempting to scrape stream links from: {video_page_url}")
+    response = make_request(video_page_url, timeout=20)
+    if not response:
+        # This function should ideally return a StreamDataItem even on error, or raise HTTPExc
+        # For now, let's let endpoint handle the None from make_request
+        raise HTTPException(status_code=500, detail=f"Failed to fetch {video_page_url}")
+
+    soup = BeautifulSoup(response.content, 'html.parser')
+    stream_data_dict = {
+        "video_page_url": video_page_url,
+        "main_video_src": None,
+        "source_tags": [],
+        "poster_image": None,
+        "sprite_previews": [],
+        "note": None,
+        "error": None
+    }
+
+    video_tag = soup.find('video', id='video_html5_api')
+    if not video_tag:
+        player_div = soup.find('div', class_='b-video-player')
+        if player_div:
+            video_tag = player_div.find('video')
+
+    if not video_tag:
+        logger.warning(f"Video player tag not found on {video_page_url}.")
+        stream_data_dict["error"] = "Video player tag not found."
+        return StreamDataItem(**stream_data_dict)
+
+    if video_tag.has_attr('src'):
+        stream_data_dict["main_video_src"] = video_tag['src']
+        # Add to sources if not covered by <source> and unique
+        is_in_source_tags = any(
+            s_tag.has_attr('src') and s_tag['src'] == video_tag['src'] 
+            for s_tag in video_tag.find_all('source')
+        )
+        if not is_in_source_tags:
+            stream_data_dict["source_tags"].append({
+                "src": video_tag['src'],
+                "type": video_tag.get('type', 'video/mp4') # Guess type
+            })
+
+    source_tags_found = video_tag.find_all('source')
+    seen_src_urls = set([stream_data_dict["main_video_src"]]) if stream_data_dict["main_video_src"] else set()
+
+    for source_tag_html in source_tags_found:
+        if source_tag_html.has_attr('src'):
+            src_url = source_tag_html['src']
+            if src_url not in seen_src_urls:
+                stream_data_dict["source_tags"].append({
+                    "src": src_url,
+                    "type": source_tag_html.get('type'),
+                    "size": source_tag_html.get('size')
+                })
+                seen_src_urls.add(src_url)
+    
+    # Convert to SourceTagItem
+    stream_data_dict["source_tags"] = [SourceTagItem(**st) for st in stream_data_dict["source_tags"]]
+
+
+    if video_tag.has_attr('poster'):
+        stream_data_dict["poster_image"] = video_tag['poster']
+
+    if video_tag.has_attr('data-preview'):
+        sprite_string = video_tag['data-preview']
+        stream_data_dict["sprite_previews"] = [sprite.strip() for sprite in sprite_string.split(',') if sprite.strip()]
+    
+    if not stream_data_dict["source_tags"] and not stream_data_dict["main_video_src"]:
+        logger.warning(f"No direct video src or source tags found for {video_page_url}.")
+        stream_data_dict["note"] = "No direct video <src> or <source> tags found. Video content might be loaded via JavaScript."
+
+    return StreamDataItem(**stream_data_dict)
+
+
+# From input_file_2.py (Search Scraper)
+def scrape_hqporn_search_page(search_content: str, page_number: int) -> Optional[List[GenericVideoListItem]]:
+    safe_search_content = quote(search_content)
+    scrape_url = f"{BASE_URL_HQPORN}/search/{safe_search_content}/{page_number}/"
     if page_number == 1:
-        scrape_url = f"{BASE_URL}/fresh/"
+        scrape_url = f"{BASE_URL_HQPORN}/search/{safe_search_content}/"
+    return _scrape_hqporn_video_list_page(scrape_url, f"search results for '{search_content}' page {page_number}")
 
-    logger.info(f"Attempting to scrape (fresh/newest): {scrape_url}")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    try:
-        response = requests.get(scrape_url, headers=headers, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching {scrape_url}: {e}")
-        return None
-    soup = BeautifulSoup(response.content, 'html.parser')
-    gallery_list_container = soup.find('div', id='galleries', class_='js-gallery-list')
-    if not gallery_list_container:
-        logger.warning(f"Gallery list container not found on {scrape_url}.")
-        return []
-    items = gallery_list_container.find_all('div', class_='b-thumb-item')
-    if not items:
-        logger.info(f"No items found on page {page_number} of /fresh/.")
-        return []
-    scraped_data = []
-    for item_soup in items:
-        data = {}
-        link_tag = item_soup.find('a', class_='js-gallery-link')
-        if link_tag:
-            href = link_tag.get('href')
-            data['link'] = f"{BASE_URL}{href}" if href and href.startswith('/') else href
-            data['gallery_id'] = link_tag.get('data-gallery-id')
-            data['thumb_id'] = link_tag.get('data-thumb-id')
-            data['preview_video_url'] = link_tag.get('data-preview')
-            data['title_attribute'] = link_tag.get('title')
-        else: continue
-        title_div = item_soup.find('div', class_='b-thumb-item__title')
-        data['title'] = title_div.get_text(separator=' ', strip=True) if title_div else data.get('title_attribute', 'N/A')
-        picture_tag = item_soup.find('picture', class_='js-gallery-img')
-        image_urls = {}
-        if picture_tag:
-            source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
-            image_urls['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
-            source_jpeg = picture_tag.find('source', attrs={'type': 'image/jpeg'})
-            image_urls['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
-            img_tag = picture_tag.find('img')
-            if img_tag: image_urls['img_src'] = img_tag.get('data-src', img_tag.get('src'))
-        data['image_urls'] = image_urls
-        duration_div = item_soup.find('div', class_='b-thumb-item__duration')
-        duration_span = duration_div.find('span') if duration_div else None
-        data['duration'] = duration_span.text.strip() if duration_span else None
-        detail_div = item_soup.find('div', class_='b-thumb-item__detail')
-        tags_list = []
-        if detail_div:
-            for tag_a in detail_div.find_all('a'):
-                tag_name = tag_a.text.strip()
-                tag_link_relative = tag_a.get('href')
-                if tag_name and tag_link_relative:
-                    tag_link_full = f"{BASE_URL}{tag_link_relative}" if tag_link_relative.startswith('/') else tag_link_relative
-                    tags_list.append({'name': tag_name, 'link': tag_link_full})
-        data['tags'] = tags_list
-        scraped_data.append(data)
-    return scraped_data
 
-def scrape_hqporn_best_page(page_number):
-    scrape_url = f"{BASE_URL}/best/{page_number}/"
-    if page_number == 1: scrape_url = f"{BASE_URL}/best/"
-    logger.info(f"Attempting to scrape (best/top-rated): {scrape_url}")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    try:
-        response = requests.get(scrape_url, headers=headers, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching {scrape_url}: {e}")
-        return None
-    soup = BeautifulSoup(response.content, 'html.parser')
-    gallery_list_container = soup.find('div', id='galleries', class_='js-gallery-list')
-    if not gallery_list_container:
-        logger.warning(f"Gallery list container not found on {scrape_url}.")
-        return []
-    items = gallery_list_container.find_all('div', class_='b-thumb-item')
-    if not items:
-        logger.info(f"No items found on page {page_number} of /best/.")
-        return []
-    scraped_data = []
-    for item_soup in items: # Same structure as fresh, could be refactored
-        data = {}
-        link_tag = item_soup.find('a', class_='js-gallery-link')
-        if link_tag:
-            href = link_tag.get('href')
-            data['link'] = f"{BASE_URL}{href}" if href and href.startswith('/') else href
-            data['gallery_id'] = link_tag.get('data-gallery-id')
-            data['thumb_id'] = link_tag.get('data-thumb-id')
-            data['preview_video_url'] = link_tag.get('data-preview')
-            data['title_attribute'] = link_tag.get('title')
-        else: continue
-        title_div = item_soup.find('div', class_='b-thumb-item__title')
-        data['title'] = title_div.get_text(separator=' ', strip=True) if title_div else data.get('title_attribute', 'N/A')
-        picture_tag = item_soup.find('picture', class_='js-gallery-img')
-        image_urls = {}
-        if picture_tag:
-            source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
-            image_urls['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
-            source_jpeg = picture_tag.find('source', attrs={'type': 'image/jpeg'})
-            image_urls['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
-            img_tag = picture_tag.find('img')
-            if img_tag: image_urls['img_src'] = img_tag.get('data-src', img_tag.get('src'))
-        data['image_urls'] = image_urls
-        duration_div = item_soup.find('div', class_='b-thumb-item__duration')
-        duration_span = duration_div.find('span') if duration_div else None
-        data['duration'] = duration_span.text.strip() if duration_span else None
-        detail_div = item_soup.find('div', class_='b-thumb-item__detail')
-        tags_list = []
-        if detail_div:
-            for tag_a in detail_div.find_all('a'):
-                tag_name = tag_a.text.strip()
-                tag_link_relative = tag_a.get('href')
-                if tag_name and tag_link_relative:
-                    tag_link_full = f"{BASE_URL}{tag_link_relative}" if tag_link_relative.startswith('/') else tag_link_relative
-                    tags_list.append({'name': tag_name, 'link': tag_link_full})
-        data['tags'] = tags_list
-        scraped_data.append(data)
-    return scraped_data
+# From input_file_3.py (Fresh Videos Scraper)
+def scrape_hqporn_fresh_page(page_number: int) -> Optional[List[GenericVideoListItem]]:
+    scrape_url = f"{BASE_URL_HQPORN}/fresh/{page_number}/"
+    if page_number == 1:
+        scrape_url = f"{BASE_URL_HQPORN}/fresh/"
+    return _scrape_hqporn_video_list_page(scrape_url, f"fresh videos page {page_number}")
 
-def scrape_hqporn_trend_page(page_number):
-    scrape_url = f"{BASE_URL}/trend/{page_number}/" # Added trailing slash consistency based on fresh/best
-    if page_number == 1: scrape_url = f"{BASE_URL}/trend/" # For page 1 use base trend URL
-    logger.info(f"Attempting to scrape (trending): {scrape_url}")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    try:
-        response = requests.get(scrape_url, headers=headers, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching {scrape_url}: {e}")
-        return None
-    soup = BeautifulSoup(response.content, 'html.parser')
-    gallery_list_container = soup.find('div', id='galleries', class_='js-gallery-list')
-    if not gallery_list_container:
-        logger.warning(f"Gallery list container not found on {scrape_url}.")
-        return []
-    items = gallery_list_container.find_all('div', class_='b-thumb-item')
-    if not items:
-        logger.info(f"No items found on page {page_number} of /trend/.")
-        return []
-    scraped_data = [] # Same structure as fresh/best
-    for item_soup in items:
-        data = {}
-        link_tag = item_soup.find('a', class_='js-gallery-link')
-        if link_tag:
-            href = link_tag.get('href')
-            data['link'] = f"{BASE_URL}{href}" if href and href.startswith('/') else href
-            data['gallery_id'] = link_tag.get('data-gallery-id')
-            data['thumb_id'] = link_tag.get('data-thumb-id')
-            data['preview_video_url'] = link_tag.get('data-preview')
-            data['title_attribute'] = link_tag.get('title')
-        else: continue
-        title_div = item_soup.find('div', class_='b-thumb-item__title')
-        data['title'] = title_div.get_text(separator=' ', strip=True) if title_div else data.get('title_attribute', 'N/A')
-        picture_tag = item_soup.find('picture', class_='js-gallery-img')
-        image_urls = {}
-        if picture_tag:
-            source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
-            image_urls['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
-            source_jpeg = picture_tag.find('source', attrs={'type': 'image/jpeg'})
-            image_urls['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
-            img_tag = picture_tag.find('img')
-            if img_tag: image_urls['img_src'] = img_tag.get('data-src', img_tag.get('src'))
-        data['image_urls'] = image_urls
-        duration_div = item_soup.find('div', class_='b-thumb-item__duration')
-        duration_span = duration_div.find('span') if duration_div else None
-        data['duration'] = duration_span.text.strip() if duration_span else None
-        detail_div = item_soup.find('div', class_='b-thumb-item__detail')
-        tags_list = []
-        if detail_div:
-            for tag_a in detail_div.find_all('a'):
-                tag_name = tag_a.text.strip()
-                tag_link_relative = tag_a.get('href')
-                if tag_name and tag_link_relative:
-                    tag_link_full = f"{BASE_URL}{tag_link_relative}" if tag_link_relative.startswith('/') else tag_link_relative
-                    tags_list.append({'name': tag_name, 'link': tag_link_full})
-        data['tags'] = tags_list
-        scraped_data.append(data)
-    return scraped_data
 
-def scrape_hqporn_pornstars_page(page_number):
-    scrape_url = f"{BASE_URL}/pornstars/{page_number}/"
-    if page_number == 1: scrape_url = f"{BASE_URL}/pornstars/"
-    logger.info(f"Attempting to scrape pornstars from: {scrape_url}")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    try:
-        response = requests.get(scrape_url, headers=headers, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching {scrape_url}: {e}")
-        return None
-    soup = BeautifulSoup(response.content, 'html.parser')
-    pornstar_list_container = soup.find('div', id='galleries', class_='js-pornstar-list') # Corrected id to 'galleries' based on general site structure; class differentiates
-    if not pornstar_list_container:
-        logger.warning(f"Pornstar list container (div#galleries.js-pornstar-list) not found on {scrape_url}.")
-        return []
-    items = pornstar_list_container.find_all('div', class_='b-thumb-item--star')
-    if not items:
-        logger.info(f"No pornstar items found on page {page_number}.")
-        return []
-    scraped_data = []
-    for item_soup in items:
-        data = {}
-        link_tag = item_soup.find('a', class_='js-pornstar-stats')
-        if link_tag:
-            href_relative = link_tag.get('href')
-            data['link'] = f"{BASE_URL}{href_relative}" if href_relative and href_relative.startswith('/') else href_relative
-            data['pornstar_id'] = link_tag.get('data-pornstar-id')
-            data['name'] = link_tag.get('title', '').strip()
-        else: continue
-        title_div = item_soup.find('div', class_='b-thumb-item__title') # This typically holds the name too
-        if title_div and title_div.get_text(strip=True) and not data.get('name'): data['name'] = title_div.get_text(strip=True)
-        picture_tag = item_soup.find('picture')
-        image_urls = {}
-        if picture_tag:
-            source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
-            image_urls['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
-            source_jpeg = picture_tag.find('source', attrs={'type': 'image/jpeg'})
-            image_urls['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
-            img_tag = picture_tag.find('img')
-            if img_tag: image_urls['img_src'] = img_tag.get('data-src', img_tag.get('src'))
-        data['image_urls'] = image_urls
-        if data.get('name') and data.get('link'): scraped_data.append(data)
-    return scraped_data
-
-def scrape_hqporn_channels_page(page_number):
-    scrape_url = f"{BASE_URL}/channels/{page_number}/"
-    if page_number == 1: scrape_url = f"{BASE_URL}/channels/"
+# From input_file_4.py (Channels Scraper)
+def scrape_hqporn_channels_page(page_number: int) -> Optional[List[ChannelItem]]:
+    scrape_url = f"{BASE_URL_HQPORN}/channels/{page_number}/"
+    if page_number == 1:
+        scrape_url = f"{BASE_URL_HQPORN}/channels/"
+        
     logger.info(f"Attempting to scrape channels from: {scrape_url}")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    try:
-        response = requests.get(scrape_url, headers=headers, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching {scrape_url}: {e}")
+    response = make_request(scrape_url)
+    if not response:
         return None
+
     soup = BeautifulSoup(response.content, 'html.parser')
-    channel_list_container = soup.find('div', id='galleries', class_='js-channel-list') # Corrected id to 'galleries'
+    channel_list_container = soup.find('div', id='galleries', class_='js-channel-list')
     if not channel_list_container:
-        logger.warning(f"Channel list container (div#galleries.js-channel-list) not found on {scrape_url}.")
+        logger.warning(f"Channel list container not found on {scrape_url}. Page: {page_number}")
         return []
-    items = channel_list_container.find_all('div', class_='b-thumb-item--cat') # Class for channels and categories
+
+    items = channel_list_container.find_all('div', class_='b-thumb-item--cat') 
     if not items:
         logger.info(f"No channel items found on page {page_number}.")
         return []
+
     scraped_data = []
     for item_soup in items:
         data = {}
         link_tag = item_soup.find('a', class_='js-channel-stats')
-        if link_tag:
-            href_relative = link_tag.get('href')
-            data['link'] = f"{BASE_URL}{href_relative}" if href_relative and href_relative.startswith('/') else href_relative
-            data['channel_id'] = link_tag.get('data-channel-id')
-            data['name'] = link_tag.get('title', '').strip()
-        else: continue
+        if not link_tag:
+            logger.warning("Found a channel item with no js-channel-stats link.")
+            continue
+
+        href_relative = link_tag.get('href')
+        data['link'] = f"{BASE_URL_HQPORN}{href_relative}" if href_relative and href_relative.startswith('/') else href_relative
+        data['channel_id'] = link_tag.get('data-channel-id')
+        data['name'] = link_tag.get('title', '').strip() # Primary name
+
         title_div = item_soup.find('div', class_='b-thumb-item__title')
-        if title_div:
+        if title_div and not data.get('name'): # Fallback if <a> title empty
             title_span = title_div.find('span')
-            if title_span and title_span.get_text(strip=True): data['name'] = title_span.get_text(strip=True)
-            elif not data.get('name') and title_div.get_text(strip=True): data['name'] = title_div.get_text(strip=True)
+            if title_span and title_span.get_text(strip=True):
+                 data['name'] = title_span.get_text(strip=True)
+        
+        image_urls_dict = {}
         picture_tag = item_soup.find('picture')
-        image_urls = {}
         if picture_tag:
             source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
-            image_urls['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
+            image_urls_dict['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
             source_jpeg = picture_tag.find('source', attrs={'type': 'image/jpeg'})
-            image_urls['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
+            image_urls_dict['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
             img_tag = picture_tag.find('img')
-            if img_tag: image_urls['img_src'] = img_tag.get('data-src', img_tag.get('src'))
-        data['image_urls'] = image_urls
-        if data.get('name') and data.get('link'): scraped_data.append(data)
+            if img_tag:
+                image_urls_dict['img_src'] = img_tag.get('data-src', img_tag.get('src'))
+        data['image_urls'] = ImageUrls(**image_urls_dict)
+        
+        if data.get('name') and data.get('link'):
+            scraped_data.append(ChannelItem(**data))
     return scraped_data
 
-def scrape_hqporn_categories_page(page_number):
-    scrape_url = f"{BASE_URL}/categories/{page_number}/" # Added trailing slash consistency
-    if page_number == 1: scrape_url = f"{BASE_URL}/categories/"
+
+# From input_file_5.py (Best Videos Scraper)
+def scrape_hqporn_best_page(page_number: int) -> Optional[List[GenericVideoListItem]]:
+    scrape_url = f"{BASE_URL_HQPORN}/best/{page_number}/"
+    if page_number == 1:
+        scrape_url = f"{BASE_URL_HQPORN}/best/"
+    return _scrape_hqporn_video_list_page(scrape_url, f"best videos page {page_number}")
+
+
+# From input_file_6.py (Categories Scraper)
+def scrape_hqporn_categories_page(page_number: int) -> Optional[List[CategoryItem]]:
+    scrape_url = f"{BASE_URL_HQPORN}/categories/{page_number}/" # Note: Original used /categories/{page_number}
+    if page_number == 1:
+        scrape_url = f"{BASE_URL_HQPORN}/categories/"
+        
     logger.info(f"Attempting to scrape categories from: {scrape_url}")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    try:
-        response = requests.get(scrape_url, headers=headers, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching {scrape_url}: {e}")
+    response = make_request(scrape_url)
+    if not response:
         return None
+
     soup = BeautifulSoup(response.content, 'html.parser')
-    category_list_container = soup.find('div', id='galleries', class_='js-category-list') # Corrected id
+    category_list_container = soup.find('div', id='galleries', class_='js-category-list')
     if not category_list_container:
-        logger.warning(f"Category list container (div#galleries.js-category-list) not found on {scrape_url}.")
+        logger.warning(f"Category list container not found on {scrape_url}. Page: {page_number}")
         return []
+
     items = category_list_container.find_all('div', class_='b-thumb-item--cat')
     if not items:
         logger.info(f"No category items found on page {page_number}.")
         return []
+
     scraped_data = []
     for item_soup in items:
         data = {}
         link_tag = item_soup.find('a', class_='js-category-stats')
-        if link_tag:
-            href_relative = link_tag.get('href')
-            data['link'] = f"{BASE_URL}{href_relative}" if href_relative and href_relative.startswith('/') else href_relative
-            data['category_id'] = link_tag.get('data-category-id')
-            data['title'] = link_tag.get('title', '').strip()
-        else: continue
+        if not link_tag:
+            logger.warning("Found a category item with no js-category-stats link.")
+            continue
+
+        href_relative = link_tag.get('href')
+        data['link'] = f"{BASE_URL_HQPORN}{href_relative}" if href_relative and href_relative.startswith('/') else href_relative
+        data['category_id'] = link_tag.get('data-category-id')
+        data['title'] = link_tag.get('title', '').strip()
+
         title_div = item_soup.find('div', class_='b-thumb-item__title')
-        if title_div and title_div.get_text(strip=True) and not data.get('title'): data['title'] = title_div.get_text(strip=True)
+        if title_div and not data.get('title') and title_div.get_text(strip=True): # Fallback for title
+             data['title'] = title_div.get_text(strip=True)
+        
+        image_urls_dict = {}
         picture_tag = item_soup.find('picture')
-        image_urls = {}
         if picture_tag:
             source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
-            image_urls['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
+            image_urls_dict['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
             source_jpeg = picture_tag.find('source', attrs={'type': 'image/jpeg'})
-            image_urls['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
+            image_urls_dict['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
             img_tag = picture_tag.find('img')
-            if img_tag: image_urls['img_src'] = img_tag.get('data-src', img_tag.get('src'))
-        data['image_urls'] = image_urls
-        if data.get('title') and data.get('link'): scraped_data.append(data)
+            if img_tag:
+                image_urls_dict['img_src'] = img_tag.get('data-src', img_tag.get('src'))
+        data['image_urls'] = ImageUrls(**image_urls_dict)
+        
+        if data.get('title') and data.get('link'):
+            scraped_data.append(CategoryItem(**data))
     return scraped_data
 
-def scrape_hqporn_search_page(search_content, page_number):
-    safe_search_content = quote(search_content)
-    scrape_url = f"{BASE_URL}/search/{safe_search_content}/{page_number}/"
-    if page_number == 1: scrape_url = f"{BASE_URL}/search/{safe_search_content}/"
-    logger.info(f"Attempting to scrape search results for '{search_content}' (page {page_number}): {scrape_url}")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    try:
-        response = requests.get(scrape_url, headers=headers, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching {scrape_url}: {e}")
+
+# From input_file_7.py (Pornstars Scraper)
+def scrape_hqporn_pornstars_page(page_number: int) -> Optional[List[PornstarItem]]:
+    scrape_url = f"{BASE_URL_HQPORN}/pornstars/{page_number}/"
+    if page_number == 1:
+        scrape_url = f"{BASE_URL_HQPORN}/pornstars/"
+        
+    logger.info(f"Attempting to scrape pornstars from: {scrape_url}")
+    response = make_request(scrape_url)
+    if not response:
         return None
+
     soup = BeautifulSoup(response.content, 'html.parser')
-    gallery_list_container = soup.find('div', id='galleries', class_='js-gallery-list')
-    if not gallery_list_container:
-        logger.warning(f"Gallery list container not found on search page {scrape_url}.")
-        return [] # Assume no results if container missing after successful HTTP GET
-    items = gallery_list_container.find_all('div', class_='b-thumb-item')
-    if not items:
-        logger.info(f"No items found for search '{search_content}' on page {page_number}.")
+    pornstar_list_container = soup.find('div', id='galleries', class_='js-pornstar-list')
+    if not pornstar_list_container:
+        logger.warning(f"Pornstar list container not found on {scrape_url}. Page: {page_number}")
         return []
-    scraped_data = [] # Same structure as fresh/best/trend
+
+    items = pornstar_list_container.find_all('div', class_='b-thumb-item--star')
+    if not items:
+        logger.info(f"No pornstar items found on page {page_number}.")
+        return []
+
+    scraped_data = []
     for item_soup in items:
         data = {}
-        link_tag = item_soup.find('a', class_='js-gallery-link')
-        if link_tag:
-            href = link_tag.get('href')
-            data['link'] = f"{BASE_URL}{href}" if href and href.startswith('/') else href
-            data['gallery_id'] = link_tag.get('data-gallery-id')
-            data['thumb_id'] = link_tag.get('data-thumb-id')
-            data['preview_video_url'] = link_tag.get('data-preview')
-            data['title_attribute'] = link_tag.get('title')
-        else: continue
-        title_div = item_soup.find('div', class_='b-thumb-item__title')
-        data['title'] = title_div.get_text(separator=' ', strip=True) if title_div else data.get('title_attribute', 'N/A')
-        picture_tag = item_soup.find('picture', class_='js-gallery-img')
-        image_urls = {}
+        link_tag = item_soup.find('a', class_='js-pornstar-stats')
+        if not link_tag:
+            logger.warning("Found a pornstar item with no js-pornstar-stats link.")
+            continue
+        
+        href_relative = link_tag.get('href')
+        data['link'] = f"{BASE_URL_HQPORN}{href_relative}" if href_relative and href_relative.startswith('/') else href_relative
+        data['pornstar_id'] = link_tag.get('data-pornstar-id')
+        data['name'] = link_tag.get('title', '').strip() # Primary name
+
+        title_div = item_soup.find('div', class_='b-thumb-item__title') # Fallback
+        if title_div and not data.get('name') and title_div.get_text(strip=True):
+            data['name'] = title_div.get_text(strip=True)
+        
+        image_urls_dict = {}
+        picture_tag = item_soup.find('picture')
         if picture_tag:
             source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
-            image_urls['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
+            image_urls_dict['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
             source_jpeg = picture_tag.find('source', attrs={'type': 'image/jpeg'})
-            image_urls['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
+            image_urls_dict['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
             img_tag = picture_tag.find('img')
-            if img_tag: image_urls['img_src'] = img_tag.get('data-src', img_tag.get('src'))
-        data['image_urls'] = image_urls
-        duration_div = item_soup.find('div', class_='b-thumb-item__duration')
-        duration_span = duration_div.find('span') if duration_div else None
-        data['duration'] = duration_span.text.strip() if duration_span else None
-        detail_div = item_soup.find('div', class_='b-thumb-item__detail')
-        tags_list = []
-        if detail_div:
-            for tag_a in detail_div.find_all('a'):
-                tag_name = tag_a.text.strip()
-                tag_link_relative = tag_a.get('href')
-                if tag_name and tag_link_relative:
-                    tag_link_full = f"{BASE_URL}{tag_link_relative}" if tag_link_relative.startswith('/') else tag_link_relative
-                    tags_list.append({'name': tag_name, 'link': tag_link_full})
-        data['tags'] = tags_list
-        scraped_data.append(data)
+            if img_tag:
+                image_urls_dict['img_src'] = img_tag.get('data-src', img_tag.get('src'))
+        data['image_urls'] = ImageUrls(**image_urls_dict)
+
+        if data.get('name') and data.get('link'):
+            scraped_data.append(PornstarItem(**data))
     return scraped_data
 
-def scrape_video_page_for_streams(video_page_url):
-    logger.info(f"Attempting to scrape stream links from: {video_page_url}")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    stream_data_template = lambda error=None, note=None: {
-        "video_page_url": video_page_url, "main_video_src": None, 
-        "source_tags": [], "poster_image": None, "sprite_previews": [],
-        "error": error, "note": note
-    }
-    try:
-        response = requests.get(video_page_url, headers=headers, timeout=20)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching {video_page_url}: {e}")
-        return stream_data_template(error=f"Failed to fetch page: {e}")
-    soup = BeautifulSoup(response.content, 'html.parser')
-    stream_data = stream_data_template() # Initialize with structure
-    video_tag = soup.find('video', id='video_html5_api') or soup.find('div', class_='b-video-player') and soup.find('div', class_='b-video-player').find('video')
-    if not video_tag:
-        logger.warning(f"Video player tag not found on {video_page_url}.")
-        stream_data["error"] = "Video player tag not found."
-        return stream_data
-    if video_tag.has_attr('src') and video_tag['src'] and not video_tag['src'].startswith('blob:'):
-        stream_data["main_video_src"] = video_tag['src']
-    source_elements = video_tag.find_all('source')
-    processed_src_urls = set()
-    if stream_data["main_video_src"]: processed_src_urls.add(stream_data["main_video_src"])
-    
-    temp_sources = []
-    # If main_video_src was directly on video tag, and no identical <source> tags will cover it
-    # add it as a source item.
-    main_src_is_also_in_source_tags = False
-    for source_el in source_elements:
-        if source_el.get('src') == stream_data["main_video_src"]:
-            main_src_is_also_in_source_tags = True
-            break
-    if stream_data["main_video_src"] and not main_src_is_also_in_source_tags:
-         temp_sources.append({
-            "src": stream_data["main_video_src"],
-            "type": video_tag.get('type', 'video/mp4'), # Default or guess type
-            "size": None # Size usually not on video tag
-        })
-         processed_src_urls.add(stream_data["main_video_src"])
 
-    for source_el in source_elements:
-        src_url = source_el.get('src')
-        if src_url and not src_url.startswith('blob:') and src_url not in processed_src_urls:
-            temp_sources.append({
-                "src": src_url,
-                "type": source_el.get('type'),
-                "size": source_el.get('data-size', source_el.get('size'))
-            })
-            processed_src_urls.add(src_url)
-    stream_data["source_tags"] = temp_sources
-    if video_tag.has_attr('poster'): stream_data["poster_image"] = video_tag['poster']
-    if video_tag.has_attr('data-preview'): # Sprite previews
-        stream_data["sprite_previews"] = [s.strip() for s in video_tag['data-preview'].split(',') if s.strip()]
-    if not stream_data["source_tags"] and not stream_data["main_video_src"] and "error" not in stream_data:
-        # Try to find sources in script tags as a fallback note
-        scripts = soup.find_all('script', string=True) # only inline scripts
-        for script in scripts:
-            if "player.src({ src:" in script.string or "new Playerjs(" in script.string:
-                logger.info(f"Potential dynamic video source in script on {video_page_url}")
-                stream_data["note"] = (stream_data.get("note","") + " Video source might be embedded in JavaScript.").strip()
-                break
-        if not stream_data.get("note") and "error" not in stream_data: # if no script hint and no other error
-            stream_data["note"] = (stream_data.get("note","") + " No direct video <src> or <source> tags found.").strip()
-    return stream_data
+# From input_file_8.py (Trend Scraper, originally just scraper_api.py)
+def scrape_hqporn_trend_page(page_number: int) -> Optional[List[GenericVideoListItem]]:
+    # Original path for this was /trend/{page_number}, without trailing slash for >1
+    # and no special /trend/ for page_number 1 in the original scraper logic for URL.
+    scrape_url = f"{BASE_URL_HQPORN}/trend/{page_number}" 
+    # If consistency with other /fresh/, /best/ etc. is desired for page 1:
+    # if page_number == 1:
+    #    scrape_url = f"{BASE_URL_HQPORN}/trend/"
+    # For now, strictly adhering to original input_file_8.py URL formation:
+    return _scrape_hqporn_video_list_page(scrape_url, f"trend videos page {page_number}")
 
 
 # --- API Endpoints ---
-@ns_fresh.route('/<int:page_number>')
-class FreshVideos(Resource):
-    @ns_fresh.doc(description='Get fresh videos for a specific page number')
-    @ns_fresh.marshal_list_with(video_model) # Use marshal_list_with for list responses
-    @ns_fresh.response(400, 'Invalid page number')
-    @ns_fresh.response(500, 'Failed to scrape the page')
-    def get(self, page_number):
-        if page_number <= 0: api.abort(400, "Page number must be positive.")
-        data = scrape_hqporn_fresh_page(page_number)
-        if data is None: api.abort(500, "Failed to scrape fresh videos page.")
-        return data # jsonify is not needed when using marshal_list_with or marshal_with
 
-@ns_best.route('/<int:page_number>')
-class BestVideos(Resource):
-    @ns_best.doc(description='Get best-rated videos for a specific page number')
-    @ns_best.marshal_list_with(video_model)
-    @ns_best.response(400, 'Invalid page number')
-    @ns_best.response(500, 'Failed to scrape the page')
-    def get(self, page_number):
-        if page_number <= 0: api.abort(400, "Page number must be positive.")
-        data = scrape_hqporn_best_page(page_number)
-        if data is None: api.abort(500, "Failed to scrape best videos page.")
-        return data
+@app.get("/")
+async def root():
+    return {
+        "message": "Welcome to the Unified Scraper API",
+        "documentation": "/docs",
+        "endpoints": {
+            "/scrape-videos (POST)": "Scrape video data from a provided URL (body: {'url': '...'}).",
+            "/api/stream/{video_page_link:path} (GET)": "Scrape stream links from a specific HQPorner video page URL.",
+            "/api/search/{search_content}/{page_number} (GET)": "Scrape search results from HQPorner.",
+            "/api/fresh/{page_number} (GET)": "Scrape fresh videos from HQPorner.",
+            "/api/channels/{page_number} (GET)": "Scrape channels from HQPorner.",
+            "/api/best/{page_number} (GET)": "Scrape best/top-rated videos from HQPorner.",
+            "/api/categories/{page_number} (GET)": "Scrape categories from HQPorner.",
+            "/api/pornstars/{page_number} (GET)": "Scrape pornstars from HQPorner.",
+            "/api/trend/{page_number} (GET)": "Scrape trending videos from HQPorner.",
+        }
+    }
 
-@ns_trend.route('/<int:page_number>')
-class TrendVideos(Resource):
-    @ns_trend.doc(description='Get trending videos for a specific page number')
-    @ns_trend.marshal_list_with(video_model)
-    @ns_trend.response(400, 'Invalid page number')
-    @ns_trend.response(500, 'Failed to scrape the page')
-    def get(self, page_number):
-        if page_number <= 0: api.abort(400, "Page number must be positive.")
-        data = scrape_hqporn_trend_page(page_number)
-        if data is None: api.abort(500, "Failed to scrape trending videos page.")
-        return data
+# Endpoint from input_file_0.py
+@app.post("/scrape-videos", response_model=List[VideoData], tags=["Generic Scraper"])
+async def scrape_videos_endpoint(request: ScrapeRequest):
+    """
+    Scrape video data from any webpage URL that matches a common thumbnail structure.
+    (Originally from file input_file_0.py)
+    """
+    try:
+        videos = scrape_videos_generic(str(request.url))
+        if not videos:
+            raise HTTPException(status_code=404, detail="No videos found on the provided webpage or structure not recognized.")
+        return videos
+    except HTTPException as e: # Re-raise HTTPExceptions
+        raise e
+    except Exception as e: # Catch other errors from the scraper
+        logger.error(f"Unhandled error in scrape_videos_endpoint for {request.url}: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-@ns_pornstars.route('/<int:page_number>')
-class Pornstars(Resource):
-    @ns_pornstars.doc(description='Get pornstars for a specific page number')
-    @ns_pornstars.marshal_list_with(pornstar_model)
-    @ns_pornstars.response(400, 'Invalid page number')
-    @ns_pornstars.response(500, 'Failed to scrape the page')
-    def get(self, page_number):
-        if page_number <= 0: api.abort(400, "Page number must be positive.")
-        data = scrape_hqporn_pornstars_page(page_number)
-        if data is None: api.abort(500, "Failed to scrape pornstars page.")
-        return data
 
-@ns_channels.route('/<int:page_number>')
-class Channels(Resource):
-    @ns_channels.doc(description='Get channels for a specific page number')
-    @ns_channels.marshal_list_with(channel_model)
-    @ns_channels.response(400, 'Invalid page number')
-    @ns_channels.response(500, 'Failed to scrape the page')
-    def get(self, page_number):
-        if page_number <= 0: api.abort(400, "Page number must be positive.")
-        data = scrape_hqporn_channels_page(page_number)
-        if data is None: api.abort(500, "Failed to scrape channels page.")
-        return data
-
-@ns_categories.route('/<int:page_number>')
-class Categories(Resource):
-    @ns_categories.doc(description='Get categories for a specific page number')
-    @ns_categories.marshal_list_with(category_model)
-    @ns_categories.response(400, 'Invalid page number')
-    @ns_categories.response(500, 'Failed to scrape the page')
-    def get(self, page_number):
-        if page_number <= 0: api.abort(400, "Page number must be positive.")
-        data = scrape_hqporn_categories_page(page_number)
-        if data is None: api.abort(500, "Failed to scrape categories page.")
-        return data
-
-@ns_search.route('/<string:search_content>/<int:page_number>')
-class SearchResults(Resource):
-    @ns_search.doc(description='Get search results for a specific query and page number')
-    @ns_search.marshal_list_with(video_model)
-    @ns_search.response(400, 'Invalid search content or page number')
-    @ns_search.response(500, 'Failed to scrape the page')
-    def get(self, search_content, page_number):
-        if not search_content: api.abort(400, "Search content cannot be empty.")
-        if page_number <= 0: api.abort(400, "Page number must be positive.")
-        data = scrape_hqporn_search_page(search_content, page_number)
-        if data is None: api.abort(500, "Failed to scrape search results page.")
-        return data
-
-@ns_stream.route('/<path:video_page_link>') # Using <path:> to capture full URLs including slashes
-class StreamLinks(Resource):
-    @ns_stream.doc(description='Get stream links for a video page URL. URL must be fully qualified.', 
-                   params={'video_page_link': 'Full URL of the video page (e.g., https://hqporn.xxx/video/...)'})
-    @ns_stream.marshal_with(stream_model) # Singular item
-    @ns_stream.response(400, 'Invalid video page link')
-    @ns_stream.response(404, 'Video player tag or stream sources not found') # Corrected 404 meaning
-    @ns_stream.response(500, 'Failed to scrape the page or error during scraping')
-    def get(self, video_page_link):
-        # Flask-RESTX path converter handles URL decoding automatically.
-        # Ensure the link is a complete URL starting with http(s)
-        if not (video_page_link.startswith("http://") or video_page_link.startswith("https://")):
-             # If it doesn't start with http, assume it might be missing (e.g. user provided 'hqporn.xxx/video/...')
-             # Try to prepend https://
-             if video_page_link.startswith(BASE_URL.replace("https://","").replace("http://","")):
-                 video_page_link = "https://" + video_page_link
-             else: # if not even the base domain, it is truly malformed.
-                 api.abort(400, f"Invalid video_page_link. It must be a full URL. Received: {video_page_link}")
-
-        logger.info(f"StreamLinks: Received request for video page link: {video_page_link}")
+# Endpoint from input_file_1.py
+@app.get("/api/stream/{video_page_link:path}", response_model=StreamDataItem, tags=["HQPorner Specific"])
+async def get_stream_links(video_page_link: str = Path(..., description="Full URL of the HQPorner video page to scrape.")):
+    """
+    Scrapes a specific HQPorner video page URL for streaming links, poster, and sprites.
+    The `video_page_link` should be the full URL.
+    Example: `https://hqporn.xxx/some-video-title_12345.html`
+    """
+    if not video_page_link.startswith("http"):
+        raise HTTPException(status_code=400, detail=f"Invalid video_page_link. It must be a full URL. Received: {video_page_link}")
+    
+    logger.info(f"Received request for video page link: {video_page_link}")
+    
+    try:
         data = scrape_video_page_for_streams(video_page_link)
+        if data.error and "Video player tag not found" in data.error:
+             # Return 200 with the data including the error message, or 404 as per original?
+             # Original returned 404, let's stick to that for "not found" type issues
+             raise HTTPException(status_code=404, detail=data.error) # Will return JSON error due to HTTPException
+        return data # Returns StreamDataItem
+    except HTTPException: # Re-raise if it's already an HTTPException (e.g. 500 from failed fetch)
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in get_stream_links for {video_page_link}: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred while scraping stream links: {str(e)}")
 
-        if data.get("error") == "Video player tag not found.":
-            api.abort(404, data["error"], **data) # Pass through original error and context
-        elif data.get("error") and "Failed to fetch page" in data["error"]:
-            api.abort(500, data["error"], **data)
-        
-        # If no explicit error, but also no sources
-        if not data.get("main_video_src") and not data.get("source_tags") and not data.get("error"):
-            # Return 200 with data noting no streams found, or 404
-            # For consistency, if no streams are found but page loaded, this can be considered "not found" for stream data
-            data["error"] = data.get("error", "No usable video stream sources found on the page.") # Add error if not already there
-            # Let's still return 200 but with the error field populated, marshal_with will handle it
-            # If a strict 404 is desired for "no streams found on valid page", then api.abort(404, ...) here
-        
-        return data
+# Helper for list-based endpoints
+async def _handle_list_scrape_request(
+    scrape_function: callable, 
+    error_message: str,
+    *args # Arguments for the scrape_function
+    ) -> List[Any]: # Return type depends on the specific model
+    
+    data = scrape_function(*args)
+    if data is None: # Scraper had a RequestException or similar critical issue
+        raise HTTPException(status_code=503, detail=f"Failed to scrape the page. The external site might be down or the request failed: {error_message}")
+    # If data is an empty list, it usually means no items found on page, which is a valid empty response
+    return data
 
-# New endpoint for generic video scraping by URL
-@ns_general_scrape.route('/scrape-videos')
-class GenericVideoScraper(Resource):
-    @ns_general_scrape.doc(description='Scrape video data from a provided hqporn.xxx URL (or similarly structured page) and return a list of video metadata.')
-    @ns_general_scrape.expect(url_input_model, validate=True)
-    @ns_general_scrape.marshal_list_with(video_model)
-    @ns_general_scrape.response(400, 'Invalid input URL')
-    @ns_general_scrape.response(404, 'No videos found on the provided webpage')
-    @ns_general_scrape.response(500, 'Error fetching or processing the webpage')
-    def post(self):
-        target_url = api.payload.get('url')
-        if not target_url or not (target_url.startswith("http://") or target_url.startswith("https://")):
-            api.abort(400, "A valid, full URL starting with http:// or https:// must be provided.")
-        
-        # Optionally, restrict to BASE_URL domain or warn
-        # if not target_url.startswith(BASE_URL):
-        #     logger.warning(f"Generic scrape target URL {target_url} is outside of {BASE_URL}. Scraper might not work as expected.")
+# Endpoint from input_file_2.py
+@app.get("/api/search/{search_content}/{page_number}", response_model=List[GenericVideoListItem], tags=["HQPorner Specific"])
+async def get_search_results_page(
+    search_content: str = Path(..., description="The search query string."),
+    page_number: int = Path(..., gt=0, description="Page number of search results.")
+):
+    if not search_content:
+        raise HTTPException(status_code=400, detail="Search content cannot be empty.")
+    return await _handle_list_scrape_request(
+        scrape_hqporn_search_page,
+        f"search: {search_content}, page: {page_number}",
+        search_content, page_number
+    )
 
-        videos_data = scrape_generic_page_videos(target_url, current_api_instance=api) # Pass api instance for abort
-        
-        if not videos_data: # Handles both empty list and None (though abort should prevent None)
-            api.abort(404, "No videos found on the provided webpage, or the page structure is not recognized by this scraper.")
-            
-        return videos_data
+# Endpoint from input_file_3.py
+@app.get("/api/fresh/{page_number}", response_model=List[GenericVideoListItem], tags=["HQPorner Specific"])
+async def get_fresh_page(page_number: int = Path(..., gt=0, description="Page number for fresh videos.")):
+    return await _handle_list_scrape_request(
+        scrape_hqporn_fresh_page,
+        f"fresh page: {page_number}",
+        page_number
+    )
 
+# Endpoint from input_file_4.py
+@app.get("/api/channels/{page_number}", response_model=List[ChannelItem], tags=["HQPorner Specific"])
+async def get_channels_page(page_number: int = Path(..., gt=0, description="Page number for channels list.")):
+    return await _handle_list_scrape_request(
+        scrape_hqporn_channels_page,
+        f"channels page: {page_number}",
+        page_number
+    )
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8080)) # Changed default port slightly for distinction
-    debug_mode_env = os.environ.get('FLASK_DEBUG', 'true').lower() # Default to true for local dev
-    debug_mode = debug_mode_env in ['1', 'true', 'on', 'yes']
-    app.run(host='0.0.0.0', port=port, debug=debug_mode)
-print("Full API code with the new endpoint integrated is ready.")
+# Endpoint from input_file_5.py
+@app.get("/api/best/{page_number}", response_model=List[GenericVideoListItem], tags=["HQPorner Specific"])
+async def get_best_rated_page(page_number: int = Path(..., gt=0, description="Page number for best-rated videos.")):
+    return await _handle_list_scrape_request(
+        scrape_hqporn_best_page,
+        f"best page: {page_number}",
+        page_number
+    )
+
+# Endpoint from input_file_6.py
+@app.get("/api/categories/{page_number}", response_model=List[CategoryItem], tags=["HQPorner Specific"])
+async def get_categories_page(page_number: int = Path(..., gt=0, description="Page number for categories list.")):
+    return await _handle_list_scrape_request(
+        scrape_hqporn_categories_page,
+        f"categories page: {page_number}",
+        page_number
+    )
+
+# Endpoint from input_file_7.py
+@app.get("/api/pornstars/{page_number}", response_model=List[PornstarItem], tags=["HQPorner Specific"])
+async def get_pornstars_page(page_number: int = Path(..., gt=0, description="Page number for pornstars list.")):
+    return await _handle_list_scrape_request(
+        scrape_hqporn_pornstars_page,
+        f"pornstars page: {page_number}",
+        page_number
+    )
+
+# Endpoint from input_file_8.py
+@app.get("/api/trend/{page_number}", response_model=List[GenericVideoListItem], tags=["HQPorner Specific"])
+async def get_trend_page(page_number: int = Path(..., gt=0, description="Page number for trending videos.")):
+    return await _handle_list_scrape_request(
+        scrape_hqporn_trend_page,
+        f"trend page: {page_number}",
+        page_number
+    )
+
+# --- For Render.com Deployment ---
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000)) # Render sets PORT env var
+    uvicorn.run(app, host="0.0.0.0", port=port)
