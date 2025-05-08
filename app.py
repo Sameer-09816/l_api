@@ -152,9 +152,10 @@ def scrape_videos_generic(url: str) -> List[VideoData]:
             webp = webp_source["srcset"] if webp_source and "srcset" in webp_source.attrs else ""
 
             link_elem = item.find("a", class_="js-gallery-stats js-gallery-link")
-            link = link_elem["href"] if link_elem and "href" in link_elem.attrs else ""
-            if link and not link.startswith("http"): # Assuming relative links need hqporn base
-                 link = f"{BASE_URL_HQPORN}{link}" if link.startswith('/') else f"{BASE_URL_HQPORN}/{link}"
+            link_href = link_elem["href"] if link_elem and "href" in link_elem.attrs else ""
+            link_full = link_href # Assume it could be absolute
+            if link_href and not link_href.startswith("http"): # Assuming relative links need hqporn base
+                 link_full = f"{BASE_URL_HQPORN}{link_href}" if link_href.startswith('/') else f"{BASE_URL_HQPORN}/{link_href}"
 
 
             gallery_id = link_elem["data-gallery-id"] if link_elem and "data-gallery-id" in link_elem.attrs else "Unknown"
@@ -165,19 +166,23 @@ def scrape_videos_generic(url: str) -> List[VideoData]:
             tags_list = []
             if categories_elem:
                 category_links = categories_elem.find_all("a")
-                tags_list = [
-                    Tag(
-                        link=cat_link["href"] if cat_link["href"].startswith("http") else f"{BASE_URL_HQPORN}{cat_link['href']}",
-                        name=cat_link.get_text(strip=True)
-                    )
-                    for cat_link in category_links if cat_link.has_attr('href')
-                ]
+                for cat_link in category_links:
+                    cat_href = cat_link.get("href")
+                    if cat_href:
+                        full_cat_link = cat_href
+                        if not cat_href.startswith("http"):
+                            full_cat_link = f"{BASE_URL_HQPORN}{cat_href}" if cat_href.startswith('/') else f"{BASE_URL_HQPORN}/{cat_href}"
+                        tags_list.append(Tag(
+                            link=full_cat_link,
+                            name=cat_link.get_text(strip=True)
+                        ))
+
 
             videos.append(VideoData(
                 duration=duration,
                 gallery_id=gallery_id,
                 image_urls=ImageUrls(img_src=img_src, jpeg=jpeg, webp=webp),
-                link=link,
+                link=link_full,
                 preview_video_url=preview_video_url,
                 tags=tags_list,
                 thumb_id=thumb_id,
@@ -193,7 +198,7 @@ def scrape_videos_generic(url: str) -> List[VideoData]:
 
 # Common parser for hqporn video list items
 def _parse_hqporn_video_item(item_soup: BeautifulSoup) -> Optional[GenericVideoListItem]:
-    data = {}
+    data: Dict[str, Any] = {} # Explicitly type data
     link_tag = item_soup.find('a', class_='js-gallery-link')
     if not link_tag:
         logger.warning("Found an item with no js-gallery-link.")
@@ -209,23 +214,23 @@ def _parse_hqporn_video_item(item_soup: BeautifulSoup) -> Optional[GenericVideoL
     title_div = item_soup.find('div', class_='b-thumb-item__title')
     data['title'] = title_div.get_text(separator=' ', strip=True) if title_div else data.get('title_attribute', 'N/A')
 
-    image_urls = {}
+    image_urls_dict: Dict[str, Optional[str]] = {} # Explicitly type
     picture_tag = item_soup.find('picture', class_='js-gallery-img')
     if picture_tag:
         source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
-        image_urls['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
+        image_urls_dict['webp'] = source_webp['srcset'] if source_webp and source_webp.has_attr('srcset') else None
         source_jpeg = picture_tag.find('source', attrs={'type': 'image/jpeg'})
-        image_urls['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
+        image_urls_dict['jpeg'] = source_jpeg['srcset'] if source_jpeg and source_jpeg.has_attr('srcset') else None
         img_tag = picture_tag.find('img')
         if img_tag:
-            image_urls['img_src'] = img_tag.get('data-src', img_tag.get('src'))
-    data['image_urls'] = ImageUrls(**image_urls)
+            image_urls_dict['img_src'] = img_tag.get('data-src', img_tag.get('src'))
+    data['image_urls'] = ImageUrls(**image_urls_dict)
 
     duration_div = item_soup.find('div', class_='b-thumb-item__duration')
     duration_span = duration_div.find('span') if duration_div else None
     data['duration'] = duration_span.text.strip() if duration_span else None
 
-    tags_list = []
+    tags_list_data = []
     detail_div = item_soup.find('div', class_='b-thumb-item__detail')
     if detail_div:
         for tag_a in detail_div.find_all('a'):
@@ -233,8 +238,8 @@ def _parse_hqporn_video_item(item_soup: BeautifulSoup) -> Optional[GenericVideoL
             tag_link_relative = tag_a.get('href')
             if tag_name and tag_link_relative:
                 tag_link_full = f"{BASE_URL_HQPORN}{tag_link_relative}" if tag_link_relative.startswith('/') else tag_link_relative
-                tags_list.append(Tag(name=tag_name, link=tag_link_full))
-    data['tags'] = tags_list
+                tags_list_data.append(Tag(name=tag_name, link=tag_link_full))
+    data['tags'] = tags_list_data
     
     return GenericVideoListItem(**data)
 
@@ -260,7 +265,7 @@ def _scrape_hqporn_video_list_page(scrape_url: str, page_description: str) -> Op
         logger.info(f"No items found on {scrape_url} for {page_description}.")
         return []
 
-    scraped_data = []
+    scraped_data: List[GenericVideoListItem] = [] # Explicitly type
     for item_soup in items:
         parsed_item = _parse_hqporn_video_item(item_soup)
         if parsed_item:
@@ -273,12 +278,10 @@ def scrape_video_page_for_streams(video_page_url: str) -> StreamDataItem:
     logger.info(f"Attempting to scrape stream links from: {video_page_url}")
     response = make_request(video_page_url, timeout=20)
     if not response:
-        # This function should ideally return a StreamDataItem even on error, or raise HTTPExc
-        # For now, let's let endpoint handle the None from make_request
         raise HTTPException(status_code=500, detail=f"Failed to fetch {video_page_url}")
 
     soup = BeautifulSoup(response.content, 'html.parser')
-    stream_data_dict = {
+    stream_data_dict: Dict[str, Any] = { # Explicitly type
         "video_page_url": video_page_url,
         "main_video_src": None,
         "source_tags": [],
@@ -301,33 +304,34 @@ def scrape_video_page_for_streams(video_page_url: str) -> StreamDataItem:
 
     if video_tag.has_attr('src'):
         stream_data_dict["main_video_src"] = video_tag['src']
-        # Add to sources if not covered by <source> and unique
         is_in_source_tags = any(
             s_tag.has_attr('src') and s_tag['src'] == video_tag['src'] 
             for s_tag in video_tag.find_all('source')
         )
         if not is_in_source_tags:
-            stream_data_dict["source_tags"].append({
-                "src": video_tag['src'],
-                "type": video_tag.get('type', 'video/mp4') # Guess type
-            })
+            stream_data_dict["source_tags"].append(SourceTagItem(
+                src=video_tag['src'],
+                type=video_tag.get('type', 'video/mp4')
+            ))
 
-    source_tags_found = video_tag.find_all('source')
-    seen_src_urls = set([stream_data_dict["main_video_src"]]) if stream_data_dict["main_video_src"] else set()
+    source_tags_html_list = video_tag.find_all('source')
+    # Ensure main_video_src if added, is a SourceTagItem, and manage seen_src_urls based on SourceTagItem.src
+    current_sources_typed: List[SourceTagItem] = list(stream_data_dict["source_tags"]) # Start with what's already there
+    seen_src_urls = {st.src for st in current_sources_typed}
 
-    for source_tag_html in source_tags_found:
+
+    for source_tag_html in source_tags_html_list:
         if source_tag_html.has_attr('src'):
             src_url = source_tag_html['src']
             if src_url not in seen_src_urls:
-                stream_data_dict["source_tags"].append({
-                    "src": src_url,
-                    "type": source_tag_html.get('type'),
-                    "size": source_tag_html.get('size')
-                })
+                current_sources_typed.append(SourceTagItem(
+                    src=src_url,
+                    type=source_tag_html.get('type'),
+                    size=source_tag_html.get('size')
+                ))
                 seen_src_urls.add(src_url)
     
-    # Convert to SourceTagItem
-    stream_data_dict["source_tags"] = [SourceTagItem(**st) for st in stream_data_dict["source_tags"]]
+    stream_data_dict["source_tags"] = current_sources_typed
 
 
     if video_tag.has_attr('poster'):
@@ -383,9 +387,9 @@ def scrape_hqporn_channels_page(page_number: int) -> Optional[List[ChannelItem]]
         logger.info(f"No channel items found on page {page_number}.")
         return []
 
-    scraped_data = []
+    scraped_data: List[ChannelItem] = [] # Explicitly type
     for item_soup in items:
-        data = {}
+        data: Dict[str, Any] = {} # Explicitly type
         link_tag = item_soup.find('a', class_='js-channel-stats')
         if not link_tag:
             logger.warning("Found a channel item with no js-channel-stats link.")
@@ -402,7 +406,7 @@ def scrape_hqporn_channels_page(page_number: int) -> Optional[List[ChannelItem]]
             if title_span and title_span.get_text(strip=True):
                  data['name'] = title_span.get_text(strip=True)
         
-        image_urls_dict = {}
+        image_urls_dict: Dict[str, Optional[str]] = {} # Explicitly type
         picture_tag = item_soup.find('picture')
         if picture_tag:
             source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
@@ -415,7 +419,10 @@ def scrape_hqporn_channels_page(page_number: int) -> Optional[List[ChannelItem]]
         data['image_urls'] = ImageUrls(**image_urls_dict)
         
         if data.get('name') and data.get('link'):
-            scraped_data.append(ChannelItem(**data))
+            try:
+                scraped_data.append(ChannelItem(**data))
+            except Exception as e:
+                logger.error(f"Error creating ChannelItem from data: {data}. Error: {e}")
     return scraped_data
 
 
@@ -429,7 +436,7 @@ def scrape_hqporn_best_page(page_number: int) -> Optional[List[GenericVideoListI
 
 # From input_file_6.py (Categories Scraper)
 def scrape_hqporn_categories_page(page_number: int) -> Optional[List[CategoryItem]]:
-    scrape_url = f"{BASE_URL_HQPORN}/categories/{page_number}/" # Note: Original used /categories/{page_number}
+    scrape_url = f"{BASE_URL_HQPORN}/categories/{page_number}/" 
     if page_number == 1:
         scrape_url = f"{BASE_URL_HQPORN}/categories/"
         
@@ -449,9 +456,9 @@ def scrape_hqporn_categories_page(page_number: int) -> Optional[List[CategoryIte
         logger.info(f"No category items found on page {page_number}.")
         return []
 
-    scraped_data = []
+    scraped_data: List[CategoryItem] = [] # Explicitly type
     for item_soup in items:
-        data = {}
+        data: Dict[str, Any] = {} # Explicitly type
         link_tag = item_soup.find('a', class_='js-category-stats')
         if not link_tag:
             logger.warning("Found a category item with no js-category-stats link.")
@@ -466,7 +473,7 @@ def scrape_hqporn_categories_page(page_number: int) -> Optional[List[CategoryIte
         if title_div and not data.get('title') and title_div.get_text(strip=True): # Fallback for title
              data['title'] = title_div.get_text(strip=True)
         
-        image_urls_dict = {}
+        image_urls_dict: Dict[str, Optional[str]] = {} # Explicitly type
         picture_tag = item_soup.find('picture')
         if picture_tag:
             source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
@@ -479,7 +486,11 @@ def scrape_hqporn_categories_page(page_number: int) -> Optional[List[CategoryIte
         data['image_urls'] = ImageUrls(**image_urls_dict)
         
         if data.get('title') and data.get('link'):
-            scraped_data.append(CategoryItem(**data))
+            try:
+                scraped_data.append(CategoryItem(**data))
+            except Exception as e:
+                logger.error(f"Error creating CategoryItem from data: {data}. Error: {e}")
+
     return scraped_data
 
 
@@ -505,9 +516,9 @@ def scrape_hqporn_pornstars_page(page_number: int) -> Optional[List[PornstarItem
         logger.info(f"No pornstar items found on page {page_number}.")
         return []
 
-    scraped_data = []
+    scraped_data: List[PornstarItem] = [] # Explicitly type
     for item_soup in items:
-        data = {}
+        data: Dict[str, Any] = {} # Explicitly type
         link_tag = item_soup.find('a', class_='js-pornstar-stats')
         if not link_tag:
             logger.warning("Found a pornstar item with no js-pornstar-stats link.")
@@ -522,7 +533,7 @@ def scrape_hqporn_pornstars_page(page_number: int) -> Optional[List[PornstarItem
         if title_div and not data.get('name') and title_div.get_text(strip=True):
             data['name'] = title_div.get_text(strip=True)
         
-        image_urls_dict = {}
+        image_urls_dict: Dict[str, Optional[str]] = {} # Explicitly type
         picture_tag = item_soup.find('picture')
         if picture_tag:
             source_webp = picture_tag.find('source', attrs={'type': 'image/webp'})
@@ -535,19 +546,16 @@ def scrape_hqporn_pornstars_page(page_number: int) -> Optional[List[PornstarItem
         data['image_urls'] = ImageUrls(**image_urls_dict)
 
         if data.get('name') and data.get('link'):
-            scraped_data.append(PornstarItem(**data))
+            try:
+                scraped_data.append(PornstarItem(**data))
+            except Exception as e:
+                logger.error(f"Error creating PornstarItem from data: {data}. Error: {e}")
     return scraped_data
 
 
 # From input_file_8.py (Trend Scraper, originally just scraper_api.py)
 def scrape_hqporn_trend_page(page_number: int) -> Optional[List[GenericVideoListItem]]:
-    # Original path for this was /trend/{page_number}, without trailing slash for >1
-    # and no special /trend/ for page_number 1 in the original scraper logic for URL.
     scrape_url = f"{BASE_URL_HQPORN}/trend/{page_number}" 
-    # If consistency with other /fresh/, /best/ etc. is desired for page 1:
-    # if page_number == 1:
-    #    scrape_url = f"{BASE_URL_HQPORN}/trend/"
-    # For now, strictly adhering to original input_file_8.py URL formation:
     return _scrape_hqporn_video_list_page(scrape_url, f"trend videos page {page_number}")
 
 
@@ -557,18 +565,9 @@ def scrape_hqporn_trend_page(page_number: int) -> Optional[List[GenericVideoList
 async def root():
     return {
         "message": "Welcome to the Unified Scraper API",
-        "documentation": "/docs",
-        "endpoints": {
-            "/scrape-videos (POST)": "Scrape video data from a provided URL (body: {'url': '...'}).",
-            "/api/stream/{video_page_link:path} (GET)": "Scrape stream links from a specific HQPorner video page URL.",
-            "/api/search/{search_content}/{page_number} (GET)": "Scrape search results from HQPorner.",
-            "/api/fresh/{page_number} (GET)": "Scrape fresh videos from HQPorner.",
-            "/api/channels/{page_number} (GET)": "Scrape channels from HQPorner.",
-            "/api/best/{page_number} (GET)": "Scrape best/top-rated videos from HQPorner.",
-            "/api/categories/{page_number} (GET)": "Scrape categories from HQPorner.",
-            "/api/pornstars/{page_number} (GET)": "Scrape pornstars from HQPorner.",
-            "/api/trend/{page_number} (GET)": "Scrape trending videos from HQPorner.",
-        }
+        "documentation_swagger": "/docs",
+        "documentation_redoc": "/redoc",
+        "endpoints_info": "See /docs or /redoc for detailed endpoint specifications."
     }
 
 # Endpoint from input_file_0.py
@@ -576,10 +575,10 @@ async def root():
 async def scrape_videos_endpoint(request: ScrapeRequest):
     """
     Scrape video data from any webpage URL that matches a common thumbnail structure.
-    (Originally from file input_file_0.py)
+    The URL must be for a page listing multiple videos (e.g., a gallery or search results page from various sites).
     """
     try:
-        videos = scrape_videos_generic(str(request.url))
+        videos = scrape_videos_generic(str(request.url)) # Convert HttpUrl to str for requests
         if not videos:
             raise HTTPException(status_code=404, detail="No videos found on the provided webpage or structure not recognized.")
         return videos
@@ -592,25 +591,22 @@ async def scrape_videos_endpoint(request: ScrapeRequest):
 
 # Endpoint from input_file_1.py
 @app.get("/api/stream/{video_page_link:path}", response_model=StreamDataItem, tags=["HQPorner Specific"])
-async def get_stream_links(video_page_link: str = Path(..., description="Full URL of the HQPorner video page to scrape.")):
+async def get_stream_links(video_page_link: str = Path(..., description="Full URL of the HQPorner video page to scrape.", example="https://hqporn.xxx/some-video-title_12345.html")):
     """
     Scrapes a specific HQPorner video page URL for streaming links, poster, and sprites.
-    The `video_page_link` should be the full URL.
-    Example: `https://hqporn.xxx/some-video-title_12345.html`
+    The `video_page_link` path parameter should be the **full URL** of the video page.
     """
-    if not video_page_link.startswith("http"):
-        raise HTTPException(status_code=400, detail=f"Invalid video_page_link. It must be a full URL. Received: {video_page_link}")
+    if not video_page_link.startswith("http://") and not video_page_link.startswith("https://"):
+        raise HTTPException(status_code=400, detail=f"Invalid video_page_link. It must be a full URL (starting with http:// or https://). Received: {video_page_link}")
     
     logger.info(f"Received request for video page link: {video_page_link}")
     
     try:
         data = scrape_video_page_for_streams(video_page_link)
         if data.error and "Video player tag not found" in data.error:
-             # Return 200 with the data including the error message, or 404 as per original?
-             # Original returned 404, let's stick to that for "not found" type issues
-             raise HTTPException(status_code=404, detail=data.error) # Will return JSON error due to HTTPException
-        return data # Returns StreamDataItem
-    except HTTPException: # Re-raise if it's already an HTTPException (e.g. 500 from failed fetch)
+             raise HTTPException(status_code=404, detail=data.error)
+        return data 
+    except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Unexpected error in get_stream_links for {video_page_link}: {e}")
@@ -619,14 +615,18 @@ async def get_stream_links(video_page_link: str = Path(..., description="Full UR
 # Helper for list-based endpoints
 async def _handle_list_scrape_request(
     scrape_function: callable, 
-    error_message: str,
-    *args # Arguments for the scrape_function
-    ) -> List[Any]: # Return type depends on the specific model
+    error_context: str, # For logging/error messages
+    *args: Any # Arguments for the scrape_function
+    ) -> List[Any]: 
     
-    data = scrape_function(*args)
-    if data is None: # Scraper had a RequestException or similar critical issue
-        raise HTTPException(status_code=503, detail=f"Failed to scrape the page. The external site might be down or the request failed: {error_message}")
-    # If data is an empty list, it usually means no items found on page, which is a valid empty response
+    try:
+        data = scrape_function(*args)
+    except Exception as e: # Catch any exception from the scraper itself before None check
+        logger.error(f"Scraper function failed for {error_context} with args {args}. Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Scraping failed for {error_context}. Error: {str(e)}")
+
+    if data is None: 
+        raise HTTPException(status_code=503, detail=f"Failed to fetch data for {error_context}. The external site might be down or the request failed.")
     return data
 
 # Endpoint from input_file_2.py
@@ -635,70 +635,78 @@ async def get_search_results_page(
     search_content: str = Path(..., description="The search query string."),
     page_number: int = Path(..., gt=0, description="Page number of search results.")
 ):
-    if not search_content:
+    """Scrape search results from HQPorner."""
+    if not search_content: # Should be caught by Path(...) but good to have
         raise HTTPException(status_code=400, detail="Search content cannot be empty.")
     return await _handle_list_scrape_request(
         scrape_hqporn_search_page,
-        f"search: {search_content}, page: {page_number}",
+        f"HQPorner search: '{search_content}', page: {page_number}",
         search_content, page_number
     )
 
 # Endpoint from input_file_3.py
 @app.get("/api/fresh/{page_number}", response_model=List[GenericVideoListItem], tags=["HQPorner Specific"])
 async def get_fresh_page(page_number: int = Path(..., gt=0, description="Page number for fresh videos.")):
+    """Scrape fresh videos from HQPorner."""
     return await _handle_list_scrape_request(
         scrape_hqporn_fresh_page,
-        f"fresh page: {page_number}",
+        f"HQPorner fresh videos page: {page_number}",
         page_number
     )
 
 # Endpoint from input_file_4.py
 @app.get("/api/channels/{page_number}", response_model=List[ChannelItem], tags=["HQPorner Specific"])
 async def get_channels_page(page_number: int = Path(..., gt=0, description="Page number for channels list.")):
+    """Scrape channels from HQPorner."""
     return await _handle_list_scrape_request(
         scrape_hqporn_channels_page,
-        f"channels page: {page_number}",
+        f"HQPorner channels page: {page_number}",
         page_number
     )
 
 # Endpoint from input_file_5.py
 @app.get("/api/best/{page_number}", response_model=List[GenericVideoListItem], tags=["HQPorner Specific"])
 async def get_best_rated_page(page_number: int = Path(..., gt=0, description="Page number for best-rated videos.")):
+    """Scrape best/top-rated videos from HQPorner."""
     return await _handle_list_scrape_request(
         scrape_hqporn_best_page,
-        f"best page: {page_number}",
+        f"HQPorner best videos page: {page_number}",
         page_number
     )
 
 # Endpoint from input_file_6.py
 @app.get("/api/categories/{page_number}", response_model=List[CategoryItem], tags=["HQPorner Specific"])
 async def get_categories_page(page_number: int = Path(..., gt=0, description="Page number for categories list.")):
+    """Scrape categories from HQPorner."""
     return await _handle_list_scrape_request(
         scrape_hqporn_categories_page,
-        f"categories page: {page_number}",
+        f"HQPorner categories page: {page_number}",
         page_number
     )
 
 # Endpoint from input_file_7.py
 @app.get("/api/pornstars/{page_number}", response_model=List[PornstarItem], tags=["HQPorner Specific"])
 async def get_pornstars_page(page_number: int = Path(..., gt=0, description="Page number for pornstars list.")):
+    """Scrape pornstars from HQPorner."""
     return await _handle_list_scrape_request(
         scrape_hqporn_pornstars_page,
-        f"pornstars page: {page_number}",
+        f"HQPorner pornstars page: {page_number}",
         page_number
     )
 
 # Endpoint from input_file_8.py
 @app.get("/api/trend/{page_number}", response_model=List[GenericVideoListItem], tags=["HQPorner Specific"])
 async def get_trend_page(page_number: int = Path(..., gt=0, description="Page number for trending videos.")):
+    """Scrape trending videos from HQPorner."""
     return await _handle_list_scrape_request(
         scrape_hqporn_trend_page,
-        f"trend page: {page_number}",
+        f"HQPorner trend videos page: {page_number}",
         page_number
     )
 
-# --- For Render.com Deployment ---
+# --- For Render.com Deployment / Local Development ---
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000)) # Render sets PORT env var
+    # This block is for local development. Render will use the Gunicorn start command.
+    port = int(os.environ.get("PORT", 8000)) 
     uvicorn.run(app, host="0.0.0.0", port=port)
