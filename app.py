@@ -541,7 +541,7 @@ def scrape_channels_page(page_number: int) -> List[ChannelData]:
     return scraped_data
 
 # API endpoints
-@app.post("/api/scrape-videos", responsemania = List[VideoData])
+@app.post("/api/scrape-videos", response_model=List[VideoData])
 async def scrape_videos_endpoint(request: ScrapeRequest):
     """
     Scrape video data from the provided URL and return a list of video metadata.
