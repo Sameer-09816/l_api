@@ -3,4 +3,5 @@ uvicorn[standard]
 requests
 beautifulsoup4
 pydantic
-python-multipart 
+python-multipart
+gunicorn  # <--- Add this line
