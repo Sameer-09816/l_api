@@ -1,7 +1,6 @@
+fastapi
+uvicorn[standard]
 requests
 beautifulsoup4
-Flask
-flask-restx
-Flask-CORS
 pydantic
-gunicorn
+python-multipart 
